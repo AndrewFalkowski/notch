@@ -1,0 +1,320 @@
+Notch — Design Spec
+===================
+2026-06-24, updated 2026-11-23
+
+
+OVERVIEW
+--------
+Notch is a CLI lab notebook for humans and agents. Plain text files, human-readable
+and editable, grep-able, with optional conveniences layered on top. The
+canonical notebook is always the daily text files; indexes and UIs are helpers.
+Emphasis on simplicity.
+
+Agents are the main readers. Features should reduce how much an agent must
+read to catch up (headlines, backlinks, digests) rather than add structure
+the writer has to manage.
+
+
+STORAGE
+-------
+Default location: ~/Documents/notch-notebook/
+Override via NB_DIR environment variable.
+
+The default is intentionally visible so the user can inspect, edit, sync, and
+commit Notch files directly. It is separate from the Notch source repository.
+
+Directory layout:
+
+  ~/Documents/notch-notebook/
+    2026-06-24.txt       ← one file per day
+    2026-06-23.txt
+    .machine-id          ← generated once per machine, stable short ID
+    .notch.lock          ← write lock; contents unused
+    .index/              ← optional generated cache; safe to delete
+
+
+ENTRY FORMAT
+------------
+Each entry starts with "---" written by the CLI. The metadata line is generated
+from CLI flags. An optional git line follows it. The body is free-form prose
+and may include tables, code, lists, Markdown, and lines containing "---".
+
+Parser rule: a line exactly equal to "---" starts a new entry only when the
+next line matches the metadata format. This lets bodies contain ordinary
+Markdown separators without corrupting the notebook. When writing, the CLI
+prefixes "> " to any body line that matches the metadata format and follows a
+"---" line, so a quoted entry stays inside the entry that quotes it.
+
+  ---
+  [14:32] andrew | skewGP-20260624-luna-003 | skewGP | finding | exp3, sGP
+  git: skewGP main@4f2a9c1
+  Posterior alpha mass is bimodal at low lambda — not a convergence failure.
+  The skew distribution has two modes at this SNR. Confirmed disappears
+  above lambda 1.4 across 3 seeds.
+
+  ---
+  [14:47] claude | skewGP-20260624-luna-004 | skewGP | result | exp3
+  git: skewGP main@4f2a9c1 dirty
+  RMSE comparison across lambda values (n=50, 10 replicates):
+
+    lambda  | gGP   | sGP   | delta
+    --------|-------|-------|------
+    0.5     | 0.412 | 0.398 | -0.014
+    1.0     | 0.387 | 0.341 | -0.046
+    1.5     | 0.361 | 0.298 | -0.063
+
+  ---
+  [15:10] andrew | espresso-20260624-luna-001 | espresso | note | roast-curve
+  15g dose, 93C, 28s pull. TDS 9.2 — brighter than yesterday's 30s shot.
+  Probably under-extracted. Try finer grind tomorrow.
+
+Metadata line fields (in order):
+  [HH:MM]  author  |  ID  |  project  |  type  |  tag1, tag2, ...
+
+Field constraints:
+  project   letters, numbers, "_", and "-"; no spaces or slashes.
+            Case-insensitive: "add" reuses the most-used existing spelling,
+            and search ignores case.
+  author    letters, numbers, "_", and "-"; usually a person or agent name
+  type      one of the entry types below
+  tags      comma-separated short labels; no commas inside a tag.
+            Case- and separator-insensitive ("nca_style" = "NCA-style"):
+            "add" reuses the most-used existing spelling and drops repeats,
+            and "search --tag" ignores the difference.
+
+Git line (optional, written automatically):
+  git: <repo> <branch>@<short sha> [dirty]
+
+  Records the git checkout "notch add" runs from: repo directory name,
+  branch ("detached" if none), HEAD, and "dirty" when tracked files have
+  uncommitted changes. Omitted outside a git checkout and inside the
+  notebook's own repository. HEAD is the commit before any uncommitted work,
+  so agents should commit before logging code work.
+
+Compatibility: new metadata goes on its own "key: value" line under the
+metadata line, never as a new metadata-line field. Older installs then read
+it as body text instead of rejecting the entry. Parsers skip entries whose
+metadata line is malformed (bad type or tag) rather than failing.
+
+First line of the body: by convention a one-sentence headline stating the
+result or decision. "search --brief" shows only this line.
+
+
+ENTRY TYPES
+-----------
+  note      general observation or thought
+  result    quantitative output, table, numbers
+  todo      something to investigate or return to
+  question  unresolved, open, needs an answer
+  status    where things stand on a thread or project
+  finding   qualitative conclusion or insight
+  digest    weekly project summary (see WEEKLY DIGESTS)
+
+
+ENTRY IDs
+---------
+Format: <project>-<YYYYMMDD>-<machine>-<NNN>
+  e.g.  skewGP-20260624-luna-003
+        espresso-20260624-luna-001
+
+Each machine gets a short stable machine ID, generated once and stored in
+.machine-id: the sanitized hostname plus a short random suffix (e.g.
+melchior-8ec2). It uses letters, numbers, "_", and "-". .machine-id must not
+be synced between machines (keep it in the notebook's .gitignore), or two
+machines would share an ID.
+
+Per-project, per-day, per-machine counter. Counter is derived at write time by
+counting existing entries for that project/date/machine in that day's file. No
+counter files or database state are kept. The ID format allows three digits,
+so a counter above 999 on one day is not supported.
+
+The CLI holds an exclusive file lock while assigning the ID and appending
+the entry. This prevents duplicate IDs for concurrent writers on the same
+machine. The machine ID prevents routine collisions when syncing notebooks
+across multiple computers.
+
+IDs encode when an entry was made and are self-describing when referenced
+anywhere.
+
+
+REFERENCES
+----------
+Cross-references go in the body as plain IDs:
+  "See skewGP-20260624-luna-003 — bimodality confirmed above lambda 1.4."
+
+Backlinks are computed when read, never stored: "notch show ID" scans the
+notebook for later entries that cite ID and ends with
+
+  -> referenced by: skewGP-20260625-luna-001 (finding), ...
+
+so old entries gain backlinks without being edited. Entries are never
+rewritten. A correction, closure, or follow-up is a new entry whose first
+line names the old one ("Corrects <ID>: ...", "Closes <ID>: ...",
+"Follows <ID>: ..."), and the old entry's backlink points readers to it.
+
+Grep to find an entry and all references to it:
+  grep -r "skewGP-20260624-luna-003" ~/Documents/notch-notebook/
+
+
+AUTHOR MARKERS
+--------------
+Human entries:  first field is the user's name (e.g. "andrew")
+Agent entries:  first field is "claude" (or agent name)
+Set by --author, then NOTCH_AUTHOR, then "claude" when running inside Claude
+Code (CLAUDECODE=1) without a terminal, then the OS user name.
+
+
+GREP PATTERNS
+-------------
+All entries for a project:
+  grep -r "| skewGP |" ~/Documents/notch-notebook/
+
+All findings ever:
+  grep -r "| finding |" ~/Documents/notch-notebook/
+
+All human entries:
+  grep -r "andrew |" ~/Documents/notch-notebook/
+
+All entries with a tag:
+  grep -r "exp3" ~/Documents/notch-notebook/
+
+All entries made at a commit:
+  grep -r "@4f2a9c1" ~/Documents/notch-notebook/
+
+Entry + body (5 lines):
+  grep -rA5 "| espresso | finding |" ~/Documents/notch-notebook/
+
+
+GIT SYNC
+--------
+The notebook directory may be a normal Git repository. The canonical files are
+plain text and safe to inspect, diff, merge, and commit manually.
+
+Recommended .gitignore for the notebook:
+
+  .index/
+  .notch.lock
+  .machine-id
+
+Daily files are append-only in normal use, so Git conflicts should be readable
+when they happen. Machine IDs make entry ID collisions unlikely across
+computers, but two machines can still both append to the same daily file before
+syncing. That is acceptable; resolve the text merge and keep both entries.
+
+
+CLI INTERFACE
+-------------
+Built in Python. Distributed as a uv tool, available globally as "notch".
+  uv tool install .
+Source edits need a reinstall:
+  uv tool install --force --reinstall-package notch .
+
+Commands:
+
+  notch
+         Full-screen Textual entry form (same as "notch tui"). Offers to
+         update the install first if the local source is newer. Without a
+         terminal (an agent's shell) it prints help instead.
+
+  notch cli
+         Prompt-based entry flow with numbered menus and a save preview.
+
+  notch add --project skewGP --type finding --tags exp3,sGP --entry "..."
+         Write an entry and print its ID. "--entry -" reads the text from
+         stdin. Without --entry: opens $EDITOR at a terminal, otherwise reads
+         stdin (so an agent never lands in an editor). Notes on stderr when
+         the project name is new, listing recent projects, to catch typos.
+         (--message is a hidden legacy alias.)
+
+  notch search [WORDS...] [--project P] [--type T] [--tag T]
+               [--since 7d|2026-11-16] [--limit N] [--brief]
+         Entries matching all filters, oldest first. WORDS must all appear
+         (any order, case-insensitive). --limit keeps the N most recent
+         matches. --brief prints the metadata line and first body line.
+         Full output is capped at the 20 most recent matches unless --limit
+         is given, with a note saying how many there were; --brief is not
+         capped.
+
+  notch catchup PROJECT [--limit N]
+         Latest digest in full, then metadata + first line of every entry
+         since (at most N, default 40), the project's 15 most used tags, then
+         undigested completed weeks.
+
+  notch digest-prep PROJECT WEEK
+         Material and instructions for one digest (see WEEKLY DIGESTS).
+
+  notch show ID [ID ...]
+         Print entries by ID, each followed by its backlinks. Exits 2 if any
+         ID is missing, after printing the rest.
+
+  notch today
+         Print today's file to stdout.
+
+  notch info
+         Notebook dir, author, machine ID, source dir, update status.
+
+  notch update-check
+         Offer to reinstall from the local source if it is newer.
+
+
+TUI
+---
+Textual form: project list (recent projects, or a new one), type,
+tags, entry editor, save. Writes entries identically to "notch add".
+
+
+WEEKLY DIGESTS
+--------------
+A digest summarizes one project's completed ISO week so agents can catch up
+without reading every entry. It is an ordinary entry of type "digest" with a
+"covers:" line instead of a git line:
+
+  ---
+  [09:10] claude | skewGP-20260706-luna-001 | skewGP | digest |
+  covers: 2026-W27
+  Digest skewGP 2026-W27: bimodality is real below lambda 1.4 (skewGP-20260630-luna-002).
+  State:
+  - ...
+
+Each digest builds on the previous one: State and Open are carried forward and
+updated, so the latest digest alone gives the project's standing. Digests are
+written oldest week first, never for the current week, and never rewrite
+entries; corrections they find are listed as "<new ID> corrects <old ID>".
+If two digests cover the same week, the later one wins.
+
+Writing is on demand rather than scheduled. "notch catchup" reports completed
+weeks with entries but no digest; the reading agent hands them to a background
+sub-agent (or tells the user) instead of interrupting its task. Notch never
+calls an LLM itself.
+
+  notch digest-prep PROJECT WEEK
+         Prints the writing instructions, the save command, the previous
+         digest, and the week's entries in full. Refuses if an earlier week
+         still lacks a digest.
+
+  notch add --type digest --covers WEEK ...
+         Requires a completed week and rejects a digest that cites IDs that
+         do not exist. Reports the length without cited IDs (target: under
+         2,500 characters). "--entry -" reads the text from stdin.
+
+Installs from before digests skip digest entries, since the type is unknown
+to them.
+
+
+LLM INDEXING (OPTIONAL, NOT IMPLEMENTED)
+---------------------------------------
+Optional search acceleration only, for semantic search. Writes embeddings or
+other cache files to .index/. The notebook works completely without it, and
+.index/ may be deleted at any time without data loss.
+
+
+SKILLS.MD (for agents)
+-----------------------
+SKILLS.md mirrors the global agent skill (~/.claude/skills/notch/SKILL.md)
+and teaches agents to:
+  - catch up with "notch catchup", then "show" only the relevant IDs
+  - hand undigested weeks to a background sub-agent via "digest-prep"
+  - write entries headline-first and concise (writing-style rules)
+  - run "notch add" from the project's checkout so the git line is accurate
+  - cite IDs, and open corrections/closures with "Corrects/Closes <ID>:"
+  - never edit existing entries
