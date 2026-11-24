@@ -19,12 +19,29 @@ class NotchCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = patch.dict(os.environ, {"NB_DIR": self.tmp.name, "NOTCH_AUTHOR": "andrew"}, clear=False)
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        self.env = patch.dict(
+            os.environ,
+            {
+                "NB_DIR": self.tmp.name,
+                "NOTCH_AUTHOR": "andrew",
+                "HOME": self.home.name,
+                "XDG_CONFIG_HOME": str(Path(self.home.name) / ".config"),
+                "XDG_CACHE_HOME": str(Path(self.home.name) / ".cache"),
+                "NOTCH_NO_UPDATE_CHECK": "1",
+                "NOTCH_MODEL": "",
+            },
+            clear=False,
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
         self.git = patch.object(cli, "git_context", return_value=None)
         self.git.start()
         self.addCleanup(self.git.stop)
+
+    def today_file(self, machine="luna"):
+        return Path(self.tmp.name) / "entries" / machine / f"{cli.utc_today().isoformat()}.txt"
 
     def run_cli(self, *argv):
         out, err = StringIO(), StringIO()
@@ -36,7 +53,7 @@ class NotchCliTests(unittest.TestCase):
         root = Path(self.tmp.name)
         (root / ".machine-id").write_text("luna\n", encoding="utf-8")
         first = cli.add_entry(project="skewGP", entry_type="note", tags="", entry="original")
-        quoted = next(cli.iter_entries(root)).text
+        quoted = cli.iter_entries(root)[0].text
         second = cli.add_entry(project="skewGP", entry_type="note", tags="", entry=f"Quoting:\n{quoted}tail text")
 
         entries = list(cli.iter_entries(root))
@@ -68,7 +85,7 @@ class NotchCliTests(unittest.TestCase):
 
         code, out, err = self.run_cli("add", "--project", "microstruct", "--entry", "three")
 
-        today = dt.date.today().strftime("%Y%m%d")
+        today = cli.utc_today().strftime("%Y%m%d")
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), f"MicroStruct-{today}-luna-003")
         self.assertIn("using existing project name 'MicroStruct'", err)
@@ -129,9 +146,9 @@ class NotchCliTests(unittest.TestCase):
         with patch.object(cli, "git_context", return_value="notch main@abc1234 dirty"):
             cli.add_entry(project="skewGP", entry_type="note", tags="", entry="headline\nbody")
 
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("| skewGP | note | \ngit: notch main@abc1234 dirty\nheadline\n", text)
-        entry = next(cli.iter_entries(root))
+        entry = cli.iter_entries(root)[0]
         self.assertEqual(entry.git, "notch main@abc1234 dirty")
         self.assertEqual(entry.headline, "headline")
         self.assertEqual(entry.body, "headline\nbody")
@@ -161,7 +178,7 @@ class NotchCliTests(unittest.TestCase):
         first = cli.add_entry(project="skewGP", entry_type="note", tags="exp3", entry="first")
         second = cli.add_entry(project="skewGP", entry_type="note", tags="exp3", entry="second")
 
-        today = dt.date.today().strftime("%Y%m%d")
+        today = cli.utc_today().strftime("%Y%m%d")
         self.assertEqual(first, f"skewGP-{today}-luna-001")
         self.assertEqual(second, f"skewGP-{today}-luna-002")
 
@@ -211,7 +228,7 @@ class NotchCliTests(unittest.TestCase):
         cli.add_entry(project="skewGP", entry_type="note", tags="", entry="first")
         cli.add_entry(project="skewGP", entry_type="note", tags="", entry="second")
 
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("first\n\n---\n", text)
 
     def test_parser_trims_inter_entry_spacer_from_entry_text(self):
@@ -250,7 +267,7 @@ class NotchCliTests(unittest.TestCase):
             code = cli.main(["--author", "codex", "add", "--project", "skewGP", "--entry", "from global"])
 
         self.assertEqual(code, 0)
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("codex |", text)
 
     def test_add_message_alias_still_writes_entry(self):
@@ -262,7 +279,7 @@ class NotchCliTests(unittest.TestCase):
             code = cli.main(["add", "--project", "skewGP", "--message", "legacy inline text"])
 
         self.assertEqual(code, 0)
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("legacy inline text", text)
 
     def test_add_reports_nb_dir_file_without_traceback(self):
@@ -306,7 +323,7 @@ class NotchCliTests(unittest.TestCase):
             ])
 
         self.assertEqual(code, 0)
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("claude |", text)
 
     def test_search_filters_metadata_tag(self):
@@ -378,7 +395,7 @@ class NotchCliTests(unittest.TestCase):
             cli.add_entry(project="one", entry_type="digest", tags="", covers="2026-W02",
                           entry="Digest one 2026-W02: found it (one-20260105-luna-001).")
 
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("| one | digest | \ncovers: 2026-W02\nDigest one", text)
         self.assertNotIn("git:", text)
         digest = list(cli.iter_entries(root))[-1]
@@ -394,7 +411,7 @@ class NotchCliTests(unittest.TestCase):
         with self.assertRaisesRegex(cli.NotchError, "need --covers"):
             add(entry="Digest")
         with self.assertRaisesRegex(cli.NotchError, "not over yet"):
-            add(entry="Digest", covers=cli.format_week(dt.date.today()))
+            add(entry="Digest", covers=cli.format_week(cli.utc_today()))
         with self.assertRaisesRegex(cli.NotchError, "unknown entry IDs: one-20260105-luna-009"):
             add(entry="Digest (one-20260105-luna-001, one-20260105-luna-009)", covers="2026-W02")
         with self.assertRaisesRegex(cli.NotchError, "only for --type digest"):
@@ -471,16 +488,18 @@ class NotchCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn(f"Notebook dir: {self.tmp.name}", out.getvalue())
-        self.assertIn("uv tool install --force --reinstall-package notch .", out.getvalue())
+        self.assertIn("Update with:", out.getvalue())
+        self.assertIn("Notch is not set up on this machine", out.getvalue())
 
     def test_update_check_reports_no_update(self):
         out = StringIO()
 
+        cli.save_config({"name": "andrew"})
         with patch("notch.cli.local_update_check", return_value=None), redirect_stdout(out):
             code = cli.main(["update-check"])
 
         self.assertEqual(code, 0)
-        self.assertIn("No local source update found.", out.getvalue())
+        self.assertIn("notch is up to date.", out.getvalue())
 
     def test_local_update_check_uses_cwd_source_checkout(self):
         source = Path(self.tmp.name)
@@ -536,7 +555,7 @@ class NotchCliTests(unittest.TestCase):
         with patch("sys.stdin", StringIO("piped text\n")):
             code, _, _ = self.run_cli("add", "-p", "one")
         self.assertEqual(code, 0)
-        self.assertEqual(next(cli.iter_entries(root)).body, "piped text")
+        self.assertEqual(cli.iter_entries(root)[0].body, "piped text")
 
     def test_add_notes_new_project(self):
         root = Path(self.tmp.name)
@@ -582,7 +601,7 @@ class NotchCliTests(unittest.TestCase):
         )
 
         self.assertIn("skewGP-", entry_id)
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("| skewGP | finding | exp3", text)
         self.assertIn("from textual", text)
 
@@ -598,7 +617,7 @@ class NotchCliTests(unittest.TestCase):
             author="codex",
         )
 
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("| new-project | note |", text)
 
     def test_initial_tui_state_uses_recent_project_default(self):
@@ -699,10 +718,11 @@ class NotchCliTests(unittest.TestCase):
         out = StringIO()
 
         with patch("notch.cli.local_update_check", return_value=update):
-            with patch("notch.cli.prompt_yes_no", return_value=True):
-                with patch("notch.cli.run_local_update", return_value=0) as run_update:
-                    with redirect_stdout(out):
-                        code = cli.main(["update-check"])
+            with patch("notch.cli.interactive_terminal", return_value=True):
+                with patch("notch.cli.prompt_yes_no", return_value=True):
+                    with patch("notch.cli.run_local_update", return_value=0) as run_update:
+                        with redirect_stdout(out):
+                            code = cli.main(["update-check"])
 
         self.assertEqual(code, 0)
         run_update.assert_called_once_with(source)
@@ -775,8 +795,8 @@ class NotchCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("skewGP-", out.getvalue())
-        self.assertIn("[", (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8"))
-        self.assertIn("codex |", (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8"))
+        self.assertIn("[", (self.today_file()).read_text(encoding="utf-8"))
+        self.assertIn("codex |", (self.today_file()).read_text(encoding="utf-8"))
 
     def test_interactive_selects_existing_project_and_type(self):
         root = Path(self.tmp.name)
@@ -789,7 +809,7 @@ class NotchCliTests(unittest.TestCase):
                 code = cli.main(["cli"])
 
         self.assertEqual(code, 0)
-        text = (root / f"{dt.date.today().isoformat()}.txt").read_text(encoding="utf-8")
+        text = (self.today_file()).read_text(encoding="utf-8")
         self.assertIn("| skewGP | finding | exp3", text)
 
     def test_read_entry_from_terminal_ends_on_dot_line(self):
@@ -840,3 +860,249 @@ class NotchCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+}
+
+
+class SharedNotebookTests(unittest.TestCase):
+    """Per-machine files, UTC, model lines, digests, sync, setup, and migration."""
+
+    run_cli = NotchCliTests.run_cli
+    today_file = NotchCliTests.today_file
+    write_day = NotchCliTests.write_day
+    digest_fixture = NotchCliTests.digest_fixture
+
+    def setUp(self):
+        NotchCliTests.setUp(self)
+        self.git_env = patch.dict(os.environ, GIT_ENV)
+        self.git_env.start()
+        self.addCleanup(self.git_env.stop)
+
+    def add(self, **kw):
+        kw.setdefault("project", "one")
+        kw.setdefault("entry_type", "note")
+        kw.setdefault("tags", "")
+        kw.setdefault("entry", "text")
+        return cli.add_entry(**kw)
+
+    def test_add_writes_to_machine_folder_and_reads_old_layout_too(self):
+        root = Path(self.tmp.name)
+        (root / ".machine-id").write_text("luna\n", encoding="utf-8")
+        (root / "2026-01-05.txt").write_text("---\n[09:00] andrew | one-20260105-old-001 | one | note | \nold\n")
+        (root / "entries" / "sol").mkdir(parents=True)
+        (root / "entries" / "sol" / "2026-01-05.txt").write_text(
+            "---\n[08:00] sam | one-20260105-sol-001 | one | note | \nfrom sol\n"
+        )
+
+        entry_id = self.add(entry="new")
+
+        self.assertTrue(entry_id.startswith(f"one-{cli.utc_today():%Y%m%d}-luna-"))
+        self.assertIn("new", self.today_file().read_text(encoding="utf-8"))
+        bodies = [entry.body for entry in cli.iter_entries(root)]
+        self.assertEqual(bodies, ["from sol", "old", "new"])  # sorted by date, then time
+
+    def test_add_uses_utc_time(self):
+        root = Path(self.tmp.name)
+        (root / ".machine-id").write_text("luna\n", encoding="utf-8")
+        fixed = cli.dt.datetime(2026, 3, 1, 23, 30, tzinfo=cli.dt.timezone.utc)
+        with patch.object(cli, "utc_now", return_value=fixed):
+            entry_id = self.add()
+        self.assertEqual(entry_id, "one-20260301-luna-001")
+        self.assertIn("[23:30] andrew", (root / "entries" / "luna" / "2026-03-01.txt").read_text())
+
+    def test_model_line_round_trips_and_agents_are_reminded(self):
+        root = Path(self.tmp.name)
+        (root / ".machine-id").write_text("luna\n", encoding="utf-8")
+        with patch.object(cli, "git_context", return_value="repo main@abc1234"):
+            self.add(entry="headline", model="claude-opus-5-5")
+        entry = cli.iter_entries(root)[0]
+        self.assertEqual((entry.git, entry.model, entry.body), ("repo main@abc1234", "claude-opus-5-5", "headline"))
+        self.assertIn("git: repo main@abc1234\nmodel: claude-opus-5-5\nheadline", entry.text)
+        with self.assertRaisesRegex(cli.NotchError, "model must use"):
+            self.add(model="bad model")
+
+        code, _, err = self.run_cli("add", "-p", "one", "--author", "codex", "--entry", "x")
+        self.assertEqual(code, 0)
+        self.assertIn("agents should pass --model", err)
+        code, _, err = self.run_cli("add", "-p", "one", "--entry", "x")
+        self.assertNotIn("--model", err)
+
+    def test_digest_waits_for_grace_period(self):
+        self.digest_fixture()  # W03 = 2026-01-12..18
+        with patch.object(cli, "utc_today", return_value=cli.dt.date(2026, 1, 20)):  # Tuesday after W03
+            entries = cli.iter_entries(Path(self.tmp.name))
+            self.assertEqual(cli.undigested_weeks(entries), [])
+            with self.assertRaisesRegex(cli.NotchError, "can be digested from 2026-01-21"):
+                cli.require_closed_week("2026-W03")
+        with patch.object(cli, "utc_today", return_value=cli.dt.date(2026, 1, 21)):
+            self.assertEqual(cli.undigested_weeks(cli.iter_entries(Path(self.tmp.name))), ["2026-W03"])
+
+    def test_second_digest_for_a_week_needs_replace(self):
+        self.digest_fixture()  # W02 already has a digest
+        (Path(self.tmp.name) / ".machine-id").write_text("luna\n", encoding="utf-8")
+        text = "Digest one 2026-W02: again (one-20260105-luna-001)."
+        with self.assertRaisesRegex(cli.NotchError, "already has a digest .*--replace"):
+            self.add(entry_type="digest", covers="2026-W02", entry=text)
+        self.add(entry_type="digest", covers="2026-W02", entry=text, replace=True)
+
+    def test_min_version_blocks_writes(self):
+        root = Path(self.tmp.name)
+        (root / "notch.toml").write_text('min_version = "99.0.0"\n', encoding="utf-8")
+        with self.assertRaisesRegex(cli.NotchError, "needs notch 99.0.0 or newer"):
+            self.add()
+
+    def test_migrate_splits_old_files_by_machine(self):
+        root = Path(self.tmp.name)
+        (root / "2026-01-05.txt").write_text(
+            "---\n[09:00] andrew | one-20260105-luna-001 | one | note | \nfirst\n\n"
+            "---\n[09:30] sam | my-proj-20260105-sol-ab12-001 | my-proj | finding | x\nsecond\n---\nnot a boundary\n\n"
+            "---\n[10:00] andrew | one-20260105-luna-002 | one | bogus | \nbad type kept\n"
+        )
+        before = [entry.entry_id for entry in cli.iter_entries(root)]
+
+        code, out, _ = self.run_cli("migrate")
+
+        self.assertEqual(code, 0, out)
+        self.assertFalse((root / "2026-01-05.txt").exists())
+        luna = (root / "entries" / "luna" / "2026-01-05.txt").read_text()
+        sol = (root / "entries" / "sol-ab12" / "2026-01-05.txt").read_text()
+        self.assertIn("bad type kept", luna)
+        self.assertIn("second\n---\nnot a boundary", sol)
+        self.assertEqual(sorted(entry.entry_id for entry in cli.iter_entries(root)), sorted(before))
+        self.assertIn("nothing to migrate", self.run_cli("migrate")[1])
+
+    def test_catchup_finds_repo_project_or_asks(self):
+        self.write_day("2026-01-05", ("one-20260105-luna-001", "finding", "git: Repo main@abc1234", "from repo"))
+        with patch.object(cli, "current_repo", return_value=("repo", "repo-clone")):
+            code, out, _ = self.run_cli("catchup")
+            self.assertEqual(code, 0)
+            self.assertIn("from repo", out)
+            self.assertEqual(cli.repo_default_project(Path(self.tmp.name)), "one")
+        with patch.object(cli, "current_repo", return_value=("other", "other")):
+            code, out, _ = self.run_cli("catchup")
+            self.assertIn("== No notch project for repo other ==", out)
+            self.assertIn("notch ignore", out)
+            code, _, err = self.run_cli("add", "--entry", "x")
+            self.assertEqual(code, 2)
+            self.assertIn("nothing is logged from repo other", err)
+            self.run_cli("ignore")
+            code, out, _ = self.run_cli("catchup")
+            self.assertIn("logging is off for repo other", out)
+            self.run_cli("ignore", "--undo")
+            self.assertIn("No notch project", self.run_cli("catchup")[1])
+
+    def test_projects_lists_repos_and_authors(self):
+        self.write_day("2026-01-05", ("one-20260105-luna-001", "note", "git: repo main@abc1234", "x"))
+        code, out, _ = self.run_cli("projects")
+        self.assertEqual(code, 0)
+        self.assertIn("one  1 entry, last 2026-01-05, repos: repo, authors: andrew", out)
+
+    def make_clone(self, remote, name, machine):
+        path = Path(self.home.name) / name
+        subprocess.run(["git", "clone", "-q", str(remote), str(path)], check=True, capture_output=True)
+        (path / ".machine-id").write_text(f"{machine}\n", encoding="utf-8")
+        (path / ".gitignore").write_text(".machine-id\n.notch.lock\n", encoding="utf-8")
+        return path
+
+    def test_sync_between_two_machines_never_conflicts(self):
+        remote = Path(self.home.name) / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        a = self.make_clone(remote, "a", "luna")
+        b = self.make_clone(remote, "b", "sol")
+
+        with patch.dict(os.environ, {"NOTCH_NO_SYNC": "1"}):
+            with patch.dict(os.environ, {"NB_DIR": str(a)}):
+                self.add(entry="from a")
+                self.assertIsNone(cli.sync_notebook(a))
+            with patch.dict(os.environ, {"NB_DIR": str(b)}):
+                self.add(entry="from b")  # same day, written before b has pulled a's entry
+                self.assertIsNone(cli.sync_notebook(b))
+                self.assertEqual(sorted(entry.body for entry in cli.iter_entries(b)), ["from a", "from b"])
+            with patch.dict(os.environ, {"NB_DIR": str(a)}):
+                self.assertIsNone(cli.sync_notebook(a))
+                self.assertEqual(sorted(entry.body for entry in cli.iter_entries(a)), ["from a", "from b"])
+                self.add(entry="a again")
+                self.assertIsNone(cli.sync_notebook(a))
+            with patch.dict(os.environ, {"NB_DIR": str(b)}):
+                self.add(entry="b again")  # both tracking the remote and diverged: rebase, no conflict
+                self.assertIsNone(cli.sync_notebook(b))
+                self.assertEqual(len(cli.iter_entries(b)), 4)
+        self.assertEqual(cli.last_sync(a)[1], "ok")
+
+    def test_sync_reports_unreachable_remote(self):
+        root = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(root / "missing.git")], check=True)
+        (root / ".machine-id").write_text("luna\n", encoding="utf-8")
+        with patch.dict(os.environ, {"NOTCH_NO_SYNC": "1"}):
+            self.add()
+        error = cli.sync_notebook(root)
+        self.assertIn("fetch failed: fatal:", error)
+        notice = cli.sync_if_stale(root)  # attempted moments ago: reports the stored failure
+        self.assertIn("Notebook sync failed", notice)
+
+    def test_setup_configures_machine_and_agent_instructions(self):
+        home = Path(self.home.name)
+        notebook = home / "nb"
+        claude_md = home / ".claude" / "CLAUDE.md"
+        claude_md.parent.mkdir(parents=True)
+        claude_md.write_text("# Mine\n\nkeep this\n", encoding="utf-8")
+        (home / ".codex").mkdir()
+        with patch.dict(os.environ, {"NB_DIR": ""}):
+            code, out, _ = self.run_cli("setup", "--name", "Andrew", "--notebook", str(notebook))
+            self.assertEqual(code, 0, out)
+            self.assertEqual(cli.notebook_dir(), notebook.resolve())
+            self.assertEqual(cli.load_config()["name"], "Andrew")
+            machine = (notebook / ".machine-id").read_text().strip()
+            self.assertTrue(machine.startswith("Andrew-"))
+            self.assertIn("min_version", (notebook / "notch.toml").read_text())
+            self.assertIn(".machine-id", (notebook / ".gitignore").read_text())
+            self.assertEqual(cli.skill_path().read_text(), cli.packaged_skill())
+            text = claude_md.read_text()
+            self.assertTrue(text.startswith("# Mine\n\nkeep this\n\n<!-- notch:begin"))
+            self.assertIn("`notch` skill", text)
+            self.assertIn("notch guide", (home / ".codex" / "AGENTS.md").read_text())
+            self.assertIn("How notch works", out)
+
+            code, out, _ = self.run_cli("setup")  # rerun keeps everything
+            self.assertEqual(claude_md.read_text(), text)
+            self.assertEqual((notebook / ".machine-id").read_text().strip(), machine)
+            self.assertIn("(unchanged)", out)
+            self.assertEqual(cli.update_notices(notebook), [])
+
+    def test_guide_prints_skill_without_frontmatter(self):
+        code, out, _ = self.run_cli("guide")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("# Notch"))
+
+    def test_remote_update_notice_compares_commits_once_a_day(self):
+        info = {"url": "https://example.invalid/notch", "vcs_info": {"vcs": "git", "commit_id": "a" * 40}}
+        latest = subprocess.CompletedProcess([], 0, f"{'b' * 40}\tHEAD\n", "")
+        with patch.dict(os.environ, {"NOTCH_NO_UPDATE_CHECK": ""}), patch.object(cli, "install_info", return_value=info):
+            with patch.object(cli, "run_git", return_value=latest) as git:
+                notice = cli.remote_update_notice()
+                cli.remote_update_notice()
+        self.assertEqual(git.call_count, 1)
+        self.assertIn("aaaaaaa -> bbbbbbb", notice)
+        self.assertIn("uv tool install --force git+https://example.invalid/notch && notch setup", notice)
+
+    def test_migrate_commits_tracked_and_untracked_old_files(self):
+        root = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".notch.lock\n.machine-id\n")
+        (root / "2026-01-05.txt").write_text("---\n[09:00] andrew | one-20260105-luna-001 | one | note | \ntracked\n")
+        subprocess.run(["git", "-C", str(root), "add", "2026-01-05.txt", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "old"], check=True)
+        (root / "2026-01-06.txt").write_text("---\n[09:00] andrew | one-20260106-luna-001 | one | note | \nuntracked\n")
+
+        code, out, _ = self.run_cli("migrate")
+
+        self.assertEqual(code, 0)
+        self.assertIn("committed", out)
+        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True)
+        self.assertEqual(status.stdout, "")
+        self.assertEqual(len(cli.iter_entries(root)), 2)

@@ -1,6 +1,6 @@
 Notch — Design Spec
 ===================
-2026-06-24, updated 2026-11-23
+2026-06-24, updated 2026-11-24 (0.2: shared notebooks)
 
 
 OVERVIEW
@@ -17,20 +17,36 @@ the writer has to manage.
 
 STORAGE
 -------
-Default location: ~/Documents/notch-notebook/
-Override via NB_DIR environment variable.
+Notebook location: NB_DIR, else "notebook" in ~/.config/notch/config.toml
+(written by "notch setup"), else ~/Documents/notch-notebook/.
 
-The default is intentionally visible so the user can inspect, edit, sync, and
-commit Notch files directly. It is separate from the Notch source repository.
+The notebook is separate from the Notch source repository and is usually a git
+repository shared by several people.
 
 Directory layout:
 
   ~/Documents/notch-notebook/
-    2026-06-24.txt       ← one file per day
-    2026-06-23.txt
-    .machine-id          ← generated once per machine, stable short ID
+    entries/
+      andrew-melchior-8ec2/
+        2026-11-24.txt   ← one file per machine per UTC day
+      sam-laptop-41c0/
+        2026-11-24.txt
+    notch.toml           ← shared settings (min_version), committed
+    .gitignore           ← .index/, .notch.lock, .machine-id
+    .machine-id          ← this machine's ID; never synced
     .notch.lock          ← write lock; contents unused
     .index/              ← optional generated cache; safe to delete
+
+Each machine writes only its own entries/<machine-id>/ folder, so no file is
+ever written by two machines and git never merges entry text. Readers take
+the union of all folders and order entries by (date, time).
+
+Notch 0.1 kept all machines' entries in shared YYYY-MM-DD.txt files at the
+notebook root. Notch still reads those, and "notch migrate" moves them into
+per-machine folders. Shared files cannot be synced safely: two machines
+appending to one file conflict on every pull, and git's union merge keeps the
+"---" separator lines only once, which folds one entry into another
+(notch-20261124-melchior-8ec2-001).
 
 
 ENTRY FORMAT
@@ -55,6 +71,7 @@ prefixes "> " to any body line that matches the metadata format and follows a
   ---
   [14:47] claude | skewGP-20260624-luna-004 | skewGP | result | exp3
   git: skewGP main@4f2a9c1 dirty
+  model: claude-opus-5-5
   RMSE comparison across lambda values (n=50, 10 replicates):
 
     lambda  | gGP   | sGP   | delta
@@ -71,6 +88,9 @@ prefixes "> " to any body line that matches the metadata format and follows a
 Metadata line fields (in order):
   [HH:MM]  author  |  ID  |  project  |  type  |  tag1, tag2, ...
 
+[HH:MM] is UTC, and the file's date is the UTC date. Entries written by notch
+0.1 used the writer's local time and date.
+
 Field constraints:
   project   letters, numbers, "_", and "-"; no spaces or slashes.
             Case-insensitive: "add" reuses the most-used existing spelling,
@@ -82,10 +102,15 @@ Field constraints:
             "add" reuses the most-used existing spelling and drops repeats,
             and "search --tag" ignores the difference.
 
-Git line (optional, written automatically):
-  git: <repo> <branch>@<short sha> [dirty]
+Optional "key: value" lines, in this order, between the metadata line and the body:
 
-  Records the git checkout "notch add" runs from: repo directory name,
+  git: <repo> <branch>@<short sha> [dirty]
+  model: <model ID>            e.g. claude-opus-5-5; agents pass --model
+  covers: <ISO week>           digests only
+
+Git line (written automatically):
+  Records the git checkout "notch add" runs from: the repo name as its origin
+  remote spells it (so every clone agrees; else the directory name),
   branch ("detached" if none), HEAD, and "dirty" when tracked files have
   uncommitted changes. Omitted outside a git checkout and inside the
   notebook's own repository. HEAD is the commit before any uncommitted work,
@@ -117,14 +142,17 @@ Format: <project>-<YYYYMMDD>-<machine>-<NNN>
   e.g.  skewGP-20260624-luna-003
         espresso-20260624-luna-001
 
-Each machine gets a short stable machine ID, generated once and stored in
-.machine-id: the sanitized hostname plus a short random suffix (e.g.
-melchior-8ec2). It uses letters, numbers, "_", and "-". .machine-id must not
+Each machine gets a stable machine ID, generated once and stored in
+.machine-id: the user's name, the sanitized hostname, and a short random
+suffix (e.g. andrew-melchior-8ec2), so an ID shows whose machine wrote it.
+"notch setup --name" replaces an ID that does not start with the name; old
+entries keep their IDs. 0.1 IDs have no name (melchior-8ec2). It uses letters, numbers, "_", and "-". .machine-id must not
 be synced between machines (keep it in the notebook's .gitignore), or two
 machines would share an ID.
 
 Per-project, per-day, per-machine counter. Counter is derived at write time by
-counting existing entries for that project/date/machine in that day's file. No
+counting existing entries for that project/date/machine in the machine's file
+for that day. No
 counter files or database state are kept. The ID format allows three digits,
 so a counter above 999 on one day is not supported.
 
@@ -159,9 +187,12 @@ Grep to find an entry and all references to it:
 AUTHOR MARKERS
 --------------
 Human entries:  first field is the user's name (e.g. "andrew")
-Agent entries:  first field is "claude" (or agent name)
+Agent entries:  first field is "claude" (or agent name), plus a model: line
 Set by --author, then NOTCH_AUTHOR, then "claude" when running inside Claude
-Code (CLAUDECODE=1) without a terminal, then the OS user name.
+Code (CLAUDECODE=1) without a terminal, then the configured name, then the OS
+user name. The model comes from --model or NOTCH_MODEL; "add" reminds known
+agent authors (claude, codex, ...) that leave it out. The machine segment of
+the ID says whose machine (and so whose agent) wrote the entry.
 
 
 GREP PATTERNS
@@ -187,26 +218,33 @@ Entry + body (5 lines):
 
 GIT SYNC
 --------
-The notebook directory may be a normal Git repository. The canonical files are
-plain text and safe to inspect, diff, merge, and commit manually.
+A notebook with a git remote syncs automatically; one without stays local.
 
-Recommended .gitignore for the notebook:
+  notch sync
+         Under the write lock: stage and commit entries/<this machine>/ only,
+         "git pull --rebase --autostash", then push. Pulls cannot conflict,
+         because no other machine touches this machine's folder. On any
+         failure it aborts a half-done rebase and reports git's error line.
+         GIT_TERMINAL_PROMPT=0, so it never waits for credentials. The
+         result and time go in .git/notch-last-sync.
 
-  .index/
-  .notch.lock
-  .machine-id
+When it runs:
+  - after "notch add" (and the TUI): a detached background "notch sync"
+  - at "notch catchup": in the foreground, if the last attempt is over an hour old
+  - around digests: "digest-prep" and "add --type digest" sync first and
+    refuse if that fails; the digest is pushed right after it is written
+A failed sync shows as a notice at the top of the next catchup.
+NOTCH_NO_SYNC=1 turns automatic syncing off.
 
-Daily files are append-only in normal use, so Git conflicts should be readable
-when they happen. Machine IDs make entry ID collisions unlikely across
-computers, but two machines can still both append to the same daily file before
-syncing. That is acceptable; resolve the text merge and keep both entries.
+Shared files (notch.toml, .gitignore) change rarely and are committed by
+"notch setup". Edit them by hand like any repo file.
 
 
 CLI INTERFACE
 -------------
-Built in Python. Distributed as a uv tool, available globally as "notch".
-  uv tool install .
-Source edits need a reinstall:
+Built in Python. Distributed as a uv tool, available globally as "notch":
+  uv tool install git+https://github.com/AndrewFalkowski/notch
+From a local checkout (development):
   uv tool install --force --reinstall-package notch .
 
 Commands:
@@ -219,12 +257,18 @@ Commands:
   notch cli
          Prompt-based entry flow with numbered menus and a save preview.
 
-  notch add --project skewGP --type finding --tags exp3,sGP --entry "..."
-         Write an entry and print its ID. "--entry -" reads the text from
-         stdin. Without --entry: opens $EDITOR at a terminal, otherwise reads
-         stdin (so an agent never lands in an editor). Notes on stderr when
-         the project name is new, listing recent projects, to catch typos.
-         (--message is a hidden legacy alias.)
+  notch setup [--name NAME] [--notebook PATH] [--clone URL]
+         Set up this machine (see SETUP). Flags only, so an agent can run it.
+
+  notch add [--project P] --type finding --tags exp3,sGP [--model M] --entry "..."
+         Write an entry to entries/<machine>/<UTC date>.txt and print its ID.
+         Inside a repo, --project defaults to the project logged from it.
+         "--entry -" reads the text from stdin. Without --entry: opens
+         $EDITOR at a terminal, otherwise reads stdin (so an agent never lands
+         in an editor). Notes on stderr when the project name is new, listing
+         recent projects, to catch typos. Refuses when the notebook's
+         min_version is newer than the install. (--message is a hidden
+         legacy alias.)
 
   notch search [WORDS...] [--project P] [--type T] [--tag T]
                [--since 7d|2026-11-16] [--limit N] [--brief]
@@ -235,10 +279,19 @@ Commands:
          is given, with a note saying how many there were; --brief is not
          capped.
 
-  notch catchup PROJECT [--limit N]
-         Latest digest in full, then metadata + first line of every entry
-         since (at most N, default 40), the project's 15 most used tags, then
-         undigested completed weeks.
+  notch catchup [PROJECT] [--limit N]
+         Notices (sync failure, updates, setup), then the latest digest in
+         full, metadata + first line of every entry since (at most N, default
+         40), the project's 15 most used tags, then undigested weeks. Without
+         PROJECT, uses the project logged from the current repo; if there is
+         none, tells the agent to ask the user whether to start one.
+
+  notch projects
+         Each project with its entry count, last date, repos, and authors.
+
+  notch ignore [--undo]
+         Stop (or resume) catchup offering to log the current repo. Stored
+         per machine in config.toml.
 
   notch digest-prep PROJECT WEEK
          Material and instructions for one digest (see WEEKLY DIGESTS).
@@ -248,13 +301,60 @@ Commands:
          ID is missing, after printing the rest.
 
   notch today
-         Print today's file to stdout.
+         Today's entries (UTC date) from every machine.
+
+  notch sync
+         Commit, pull, and push now (see GIT SYNC).
 
   notch info
-         Notebook dir, author, machine ID, source dir, update status.
+         Version, notebook dir, config, author, machine ID, last sync, the
+         update command, and notices.
 
   notch update-check
-         Offer to reinstall from the local source if it is newer.
+         Print notices; at a terminal, offer to reinstall from a newer local
+         source checkout.
+
+  notch guide
+         Print the agent conventions (the packaged skill, without frontmatter).
+
+  notch migrate
+         Move 0.1 root-level daily files into entries/<machine>/, splitting
+         each by the machine segment of its entry IDs. Checks that the set of
+         entry IDs is unchanged before deleting anything, then commits.
+
+
+SETUP
+-----
+"notch setup" makes one machine ready, and rerunning it is safe:
+  - clone the shared notebook (--clone) or use/create a directory
+  - write ~/.config/notch/config.toml: notebook path and name
+  - make the machine ID start with the name
+  - add the notebook's .gitignore lines and notch.toml (min_version = this
+    version) if missing, and commit them
+  - point out 0.1 root-level files that "notch migrate" should move
+  - install the packaged skill to ~/.claude/skills/notch/SKILL.md
+  - add a marked block (<!-- notch:begin --> ... <!-- notch:end -->) to
+    ~/.claude/CLAUDE.md, and to ~/.codex/AGENTS.md if ~/.codex exists; reruns
+    replace the block and leave the rest of the file alone
+  - run a test sync, then print a short explanation of how notch works
+
+
+UPDATES
+-------
+Notch never installs anything itself. It prints a notice with the exact
+command, and the skill tells agents to ask the user before running it.
+Notices appear at the top of "catchup" and in "info":
+  - the notebook's notch.toml min_version is newer than the install ("add"
+    also refuses to write)
+  - for a git install, the remote's commit differs from the installed one
+    (git ls-remote, at most once a day, cached in ~/.cache/notch/;
+    NOTCH_NO_UPDATE_CHECK=1 turns it off)
+  - a local source checkout is newer than the install
+  - this machine is not set up, or its installed skill differs from the
+    packaged one
+The update command reinstalls and then runs "notch setup", so the skill and
+global instructions move with the version. Raise min_version in notch.toml
+when a release changes the notebook format.
 
 
 TUI
@@ -280,7 +380,10 @@ Each digest builds on the previous one: State and Open are carried forward and
 updated, so the latest digest alone gives the project's standing. Digests are
 written oldest week first, never for the current week, and never rewrite
 entries; corrections they find are listed as "<new ID> corrects <old ID>".
-If two digests cover the same week, the later one wins.
+A week can be digested from the Wednesday (UTC) after it ends, so every
+machine has had two days to sync its entries. "add --type digest" syncs first
+and refuses a second digest for a week unless --replace is passed (another
+machine may have written one); if two still cover a week, the later wins.
 
 Writing is on demand rather than scheduled. "notch catchup" reports completed
 weeks with entries but no digest; the reading agent hands them to a background
@@ -308,13 +411,16 @@ other cache files to .index/. The notebook works completely without it, and
 .index/ may be deleted at any time without data loss.
 
 
-SKILLS.MD (for agents)
------------------------
-SKILLS.md mirrors the global agent skill (~/.claude/skills/notch/SKILL.md)
-and teaches agents to:
-  - catch up with "notch catchup", then "show" only the relevant IDs
+AGENT SKILL
+-----------
+src/notch/SKILL.md is the single source of the agent conventions. It ships in
+the package; "notch setup" installs it for Claude Code and "notch guide"
+prints it for other agents. It teaches agents to:
+  - catch up with "notch catchup" in the repo, then "show" only the relevant IDs
+  - relay notices, and run update commands only with the user's OK
+  - ask the user before starting a project for an unlogged repo
   - hand undigested weeks to a background sub-agent via "digest-prep"
   - write entries headline-first and concise (writing-style rules)
-  - run "notch add" from the project's checkout so the git line is accurate
+  - run "notch add" from the repo the entry is about, with --model
   - cite IDs, and open corrections/closures with "Corrects/Closes <ID>:"
   - never edit existing entries

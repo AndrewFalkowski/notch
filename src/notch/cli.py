@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import getpass
 import importlib.metadata
+import importlib.resources
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import termios
 import tomllib
 import tty
@@ -47,13 +49,23 @@ META_RE = re.compile(
     r"(?P<tags>.*)$"
 )
 # Optional "key: value" lines between the metadata line and the body.
-META_LINE_RE = re.compile(r"^(?P<key>git|covers): (?P<value>\S.*)$")
+META_LINE_RE = re.compile(r"^(?P<key>git|model|covers): (?P<value>\S.*)$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 ID_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]+-\d{8}-[A-Za-z0-9_-]+-\d{3}(?![A-Za-z0-9_-])")
 WEEK_RE = re.compile(r"^(?P<year>\d{4})-W(?P<week>\d{2})$")
 BRIEF_WIDTH = 200
 CATCHUP_LIMIT = 40
 SEARCH_FULL_LIMIT = 20
 CATCHUP_TAGS = 15
+ENTRIES_DIR = "entries"  # entries/<machine-id>/YYYY-MM-DD.txt; each machine writes only its own folder
+SETTINGS_FILE = "notch.toml"  # shared notebook settings, committed with the notebook
+DIGEST_GRACE_DAYS = 2  # a week can be digested from the Wednesday after it (UTC)
+SYNC_INTERVAL = 3600  # catchup pulls when the last sync is older than this (seconds)
+UPDATE_INTERVAL = 86400  # check GitHub for a newer notch at most once a day
+AGENT_AUTHORS = {"claude", "codex", "gemini", "cursor", "copilot", "agent"}
+NOTEBOOK_GITIGNORE = [".index/", ".notch.lock", ".machine-id"]
+BLOCK_BEGIN = "<!-- notch:begin (managed by `notch setup`; edits inside are overwritten) -->"
+BLOCK_END = "<!-- notch:end -->"
 DIGEST_INSTRUCTIONS = """\
 Write a digest of one project-week. Agents will read it instead of the
 entries, so it must be short, exact, and grounded in the material below: the
@@ -99,12 +111,15 @@ class Entry:
     entry_type: str
     tags: tuple[str, ...]
     git: str | None = None
+    model: str | None = None
     covers: str | None = None
 
     @property
     def body(self) -> str:
         lines = self.text.splitlines()[2:]
-        present = {key for key, value in (("git", self.git), ("covers", self.covers)) if value}
+        present = {
+            key for key, value in (("git", self.git), ("model", self.model), ("covers", self.covers)) if value
+        }
         while lines and present:
             match = META_LINE_RE.match(lines[0])
             if not match or match.group("key") not in present:
@@ -186,17 +201,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     add = subparsers.add_parser("add", help="add a notebook entry")
-    add.add_argument("--project", "-p", required=True)
+    add.add_argument("--project", "-p", help="defaults to the project logged from the current repo")
     add.add_argument("--type", "-t", default="note", choices=sorted(ENTRY_TYPES))
     add.add_argument("--tags", default="")
     add.add_argument("--entry", "-e", dest="entry", help="entry text, or - to read it from stdin")
     add.add_argument("--message", "-m", dest="entry", help=argparse.SUPPRESS)
     add.add_argument("--author", default=argparse.SUPPRESS)
+    add.add_argument("--model", help="the agent's model ID, e.g. claude-opus-5-5 (or set NOTCH_MODEL)")
     add.add_argument("--covers", metavar="WEEK", help="for --type digest: the ISO week covered, e.g. 2026-W47")
+    add.add_argument("--replace", action="store_true", help="for --type digest: supersede the week's existing digest")
     add.set_defaults(func=cmd_add)
 
     catchup = subparsers.add_parser("catchup", help="latest digest, recent entries, and undigested weeks")
-    catchup.add_argument("project")
+    catchup.add_argument("project", nargs="?", help="defaults to the project logged from the current repo")
     catchup.add_argument("--limit", "-n", type=positive_int, default=CATCHUP_LIMIT, help="max recent entries listed")
     catchup.set_defaults(func=cmd_catchup)
 
@@ -231,8 +248,36 @@ def build_parser() -> argparse.ArgumentParser:
     info = subparsers.add_parser("info", help="show notebook location and install notes")
     info.set_defaults(func=cmd_info)
 
-    update_check = subparsers.add_parser("update-check", help="check local source for a newer install")
+    update_check = subparsers.add_parser("update-check", help="check for a newer notch and other install notices")
     update_check.set_defaults(func=cmd_update_check)
+
+    sync = subparsers.add_parser("sync", help="commit this machine's entries, pull, and push")
+    sync.add_argument("--quiet", "-q", action="store_true")
+    sync.set_defaults(func=cmd_sync)
+
+    setup = subparsers.add_parser(
+        "setup",
+        help="set up this machine: notebook, name, agent skill and instructions",
+        description="Set up notch on this machine. Safe to rerun; with no flags it refreshes the "
+        "agent skill and instructions using the saved settings.",
+    )
+    setup.add_argument("--name", help="your name, used as your author name and in this machine's ID")
+    setup.add_argument("--notebook", help="notebook directory (default ~/Documents/notch-notebook)")
+    setup.add_argument("--clone", metavar="URL", help="clone a shared notebook repo into the notebook directory")
+    setup.set_defaults(func=cmd_setup)
+
+    guide = subparsers.add_parser("guide", help="print the agent conventions (the notch skill)")
+    guide.set_defaults(func=cmd_guide)
+
+    projects = subparsers.add_parser("projects", help="list projects with their repos and authors")
+    projects.set_defaults(func=cmd_projects)
+
+    ignore = subparsers.add_parser("ignore", help="stop catchup offering to log the current repo")
+    ignore.add_argument("--undo", action="store_true", help="offer again")
+    ignore.set_defaults(func=cmd_ignore)
+
+    migrate = subparsers.add_parser("migrate", help="move old shared daily files into per-machine folders")
+    migrate.set_defaults(func=cmd_migrate)
 
     return parser
 
@@ -254,6 +299,8 @@ def cmd_interactive(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    root = notebook_dir()
+    project = args.project or repo_default_project(root)
     if args.entry == "-" or (args.entry is None and not sys.stdin.isatty()):
         entry = sys.stdin.read()
         if not entry.strip():
@@ -261,28 +308,54 @@ def cmd_add(args: argparse.Namespace) -> int:
     else:
         entry = args.entry if args.entry is not None else read_entry_from_editor("")
     author = getattr(args, "author", None)
-    projects = [project for project, _ in recent_projects(notebook_dir())]
-    if projects and args.project.casefold() not in {project.casefold() for project in projects}:
+    model = args.model or os.environ.get("NOTCH_MODEL") or None
+    if model is None and (author or default_author()).casefold() in AGENT_AUTHORS:
+        print("notch: agents should pass --model with their model ID, e.g. --model claude-opus-5-5", file=sys.stderr)
+    projects = [name for name, _ in recent_projects(root)]
+    if projects and project.casefold() not in {name.casefold() for name in projects}:
         print(
-            f"notch: started new project '{args.project}' (recent: {', '.join(projects[:8])})",
+            f"notch: started new project '{project}' (recent: {', '.join(projects[:8])})",
             file=sys.stderr,
         )
+    if args.type == "digest" and notebook_remote(root) and not os.environ.get("NOTCH_NO_SYNC"):
+        error = sync_notebook(root)  # another machine may have written this digest already
+        if error:
+            raise NotchError(f"digest not written: sync failed ({error}); retry when the notebook can sync")
     entry_id = add_entry(
-        project=args.project,
+        project=project,
         entry_type=args.type,
         tags=args.tags,
         entry=entry,
         author=author,
+        model=model,
         covers=args.covers,
+        replace=args.replace,
     )
     if args.type == "digest":
         length = len(ID_RE.sub("", entry.strip()))
         print(f"notch: digest is {length:,} characters without cited IDs (target: under 2,500)", file=sys.stderr)
-    if not entry_id.startswith(f"{args.project}-"):
+        if notebook_remote(root) and not os.environ.get("NOTCH_NO_SYNC"):
+            error = sync_notebook(root)
+            if error:
+                print(f"notch: digest saved but not pushed ({error}); `notch sync` retries", file=sys.stderr)
+    if not entry_id.startswith(f"{project}-"):
         canonical = entry_id.rsplit("-", 4)[0]
-        print(f"notch: using existing project name '{canonical}' for '{args.project}'", file=sys.stderr)
+        print(f"notch: using existing project name '{canonical}' for '{project}'", file=sys.stderr)
     print(entry_id)
     return 0
+
+
+def repo_default_project(root: Path) -> str:
+    repo = current_repo(root)
+    if repo is None:
+        raise NotchError("pass --project (not inside a git repo; `notch projects` lists projects)")
+    projects = repo_projects(iter_entries(root), repo)
+    if not projects:
+        raise NotchError(
+            f"pass --project: nothing is logged from repo {repo[0]} yet "
+            f"(the repo name, {repo[0]}, is the usual choice; `notch projects` lists projects)"
+        )
+    return projects[0]
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -299,9 +372,11 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
 
 def cmd_today(args: argparse.Namespace) -> int:
-    path = notebook_dir() / f"{dt.date.today().isoformat()}.txt"
-    if path.exists():
-        print(path.read_text(), end="")
+    today = utc_today()
+    for idx, entry in enumerate(entry for entry in iter_entries(notebook_dir()) if entry.date == today):
+        if idx:
+            print()
+        print(entry.text, end="")
     return 0
 
 
@@ -375,7 +450,32 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_catchup(args: argparse.Namespace) -> int:
-    project, entries = project_entries(iter_entries(notebook_dir()), args.project)
+    root = notebook_dir()
+    print_notices([notice for notice in [sync_if_stale(root), *update_notices(root)] if notice])
+    all_entries = iter_entries(root)
+    requested = args.project
+    if requested is None:
+        repo = current_repo(root)
+        if repo is None:
+            raise NotchError("not inside a git repo: pass the project, e.g. notch catchup PROJECT (see notch projects)")
+        if repo_ignored(repo):
+            print(f"Notch logging is off for repo {repo[0]} on this machine (`notch ignore --undo` turns it on).")
+            return 0
+        linked = repo_projects(all_entries, repo)
+        if not linked:
+            print(
+                f"== No notch project for repo {repo[0]} ==\n"
+                "Nothing has been logged from this repo. Ask the user once whether to keep a notch log for it.\n"
+                f"- Yes: agree on a project name (usually the repo name, {repo[0]}; check `notch projects` for\n"
+                "  an existing one), then from this repo run:\n"
+                f"  notch add --project {repo[0]} --type note --entry \"Started a notch log for {repo[0]}: <what it is>.\"\n"
+                "- No: run `notch ignore` here so later sessions do not ask again."
+            )
+            return 0
+        requested = linked[0]
+        if len(linked) > 1:
+            print(f"(repo {repo[0]} also has entries under: {', '.join(linked[1:])})")
+    project, entries = project_entries(all_entries, requested)
     digests = digests_by_week(entries)
     since: dt.date | None = None
     if digests:
@@ -436,7 +536,12 @@ def cmd_digest_prep(args: argparse.Namespace) -> int:
     monday, sunday = parse_week(args.week)
     week = format_week(monday)
     require_closed_week(week)
-    project, entries = project_entries(iter_entries(notebook_dir()), args.project)
+    root = notebook_dir()
+    if notebook_remote(root) and not os.environ.get("NOTCH_NO_SYNC"):
+        error = sync_notebook(root)  # the digest must see every machine's entries
+        if error:
+            raise NotchError(f"sync failed ({error}); a digest needs every machine's entries, so retry when online")
+    project, entries = project_entries(iter_entries(root), args.project)
     weeks = week_entries(entries)
     if week not in weeks:
         raise NotchError(f"no {project} entries in {week}")
@@ -450,11 +555,17 @@ def cmd_digest_prep(args: argparse.Namespace) -> int:
 
     print(f"DIGEST TASK: {project} {week} ({monday} to {sunday}), {count_entries(len(weeks[week]))}")
     if week in digests:
-        print(f"A digest for {week} already exists ({digests[week].entry_id}); a new one replaces it.")
+        print(
+            f"A digest for {week} already exists ({digests[week].entry_id}). Stop unless the user asked for a\n"
+            "replacement; then add --replace to the save command."
+        )
     print()
     print(DIGEST_INSTRUCTIONS.replace("PROJECT WEEK", f"{project} {week}"))
     print("Save it with (the quoted heredoc avoids shell-quoting problems):")
-    print(f"  notch add --project {project} --type digest --covers {week} --author AGENT --entry - <<'DIGEST'")
+    print(
+        f"  notch add --project {project} --type digest --covers {week} --author AGENT --model MODEL "
+        "--entry - <<'DIGEST'"
+    )
     print("  ...digest text...")
     print("  DIGEST")
     spellings = sorted({entry.project for entry in weeks[week]})
@@ -508,32 +619,42 @@ def week_entries(entries: Iterable[Entry]) -> dict[str, list[Entry]]:
 def undigested_weeks(entries: list[Entry]) -> list[str]:
     """Completed weeks that have entries but no digest, oldest first."""
     digests = digests_by_week(entries)
-    current = format_week(dt.date.today())
-    return sorted(week for week in week_entries(entries) if week < current and week not in digests)
+    return sorted(
+        week for week in week_entries(entries) if week not in digests and utc_today() >= digestible_from(week)
+    )
 
 
 def cmd_info(args: argparse.Namespace) -> int:
     root = notebook_dir()
-    update = local_update_check()
-    source = update.source_dir if update else working_tree_source_dir() or local_source_dir()
+    sync = last_sync(root)
+    if not notebook_remote(root):
+        sync_text = "off (not a git repository with a remote)"
+    elif sync is None:
+        sync_text = "never"
+    else:
+        when = dt.datetime.fromtimestamp(sync[0], dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        sync_text = f"{when}, {sync[1]}"
     print(f"Version:      {notch_version()}")
     print(f"Notebook dir: {root}")
+    print(f"Config:       {config_path()}{'' if config_path().exists() else ' (missing: run notch setup)'}")
     print(f"Author:       {args.author or default_author()}")
     print(f"Machine ID:   {machine_id_status(root)}")
-    print(f"Source dir:   {source}")
-    print(f"Update check: {update_status_text(update)}")
+    print(f"Last sync:    {sync_text}")
+    print(f"Update with:  {upgrade_command()}")
     print()
-    print("Notes are plain text daily files in the notebook dir.")
-    print("Local source edits do not automatically update a global uv tool install.")
-    print("After changing Notch, run this from the source repo:")
-    print("  uv tool install --force --reinstall-package notch .")
+    print("Entries are plain text: entries/<machine>/YYYY-MM-DD.txt in the notebook dir, times in UTC.")
+    print()
+    print_notices(update_notices(root))
     return 0
 
 
 def cmd_update_check(args: argparse.Namespace) -> int:
+    notices = update_notices(notebook_dir())
     update = local_update_check()
-    if not update:
-        print("No local source update found.")
+    if not update or not interactive_terminal():
+        print_notices(notices)
+        if not notices:
+            print("notch is up to date.")
         return 0
     print(f"Local source is newer: {update.source_dir}")
     if prompt_yes_no("Update global notch now? [y/N]", default=False):
@@ -721,7 +842,9 @@ def add_entry(
     tags: str,
     entry: str,
     author: str | None = None,
+    model: str | None = None,
     covers: str | None = None,
+    replace: bool = False,
 ) -> str:
     parsed_tags = validate_entry_metadata(
         project=project,
@@ -729,51 +852,69 @@ def add_entry(
         tags=tags,
         author=author,
     )
+    if model is not None and not MODEL_RE.match(model):
+        raise NotchError("model must use only letters, numbers, '.', '_' and '-', e.g. claude-opus-5-5")
     entry = escape_entry_boundaries(entry.strip())
     if not entry:
         raise NotchError("entry is empty")
 
     root = notebook_dir()
     root.mkdir(parents=True, exist_ok=True)
+    require_min_version(root)
     project, parsed_tags = canonical_names(root, project, parsed_tags)
     if entry_type == "digest":
-        covers = validate_digest(root, covers, entry)
+        covers = validate_digest(root, project, covers, entry, replace=replace)
         git_line = ""  # repo state at writing time says nothing about the week covered
     else:
         if covers:
             raise NotchError("--covers is only for --type digest")
         git = git_context(root)
         git_line = f"git: {git}\n" if git else ""
+    model_line = f"model: {model}\n" if model else ""
     covers_line = f"covers: {covers}\n" if covers else ""
-    today = dt.date.today()
-    path = root / f"{today.isoformat()}.txt"
+    now = utc_now()
+    today = now.date()
 
     with file_lock(root):
         machine = machine_id(root)
-        existing = path.read_text() if path.exists() else ""
+        path = root / ENTRIES_DIR / machine / f"{today.isoformat()}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
         seq = next_sequence(existing, project, today, machine)
         entry_id = f"{project}-{today.strftime('%Y%m%d')}-{machine}-{seq:03d}"
-        now = dt.datetime.now().strftime("%H:%M")
         tag_text = ", ".join(parsed_tags)
-        text = f"---\n[{now}] {author or default_author()} | {entry_id} | {project} | {entry_type} | {tag_text}\n{git_line}{covers_line}{entry}\n"
+        text = (
+            f"---\n[{now.strftime('%H:%M')}] {author or default_author()} | {entry_id} | {project} | "
+            f"{entry_type} | {tag_text}\n{git_line}{model_line}{covers_line}{entry}\n"
+        )
         with path.open("a", encoding="utf-8") as handle:
             if existing and not existing.endswith("\n"):
                 handle.write("\n")
             if existing:
                 handle.write("\n")
             handle.write(text)
+    if entry_type != "digest":  # cmd_add pushes digests in the foreground
+        start_background_sync(root)
     return entry_id
 
 
-def validate_digest(root: Path, covers: str | None, entry: str) -> str:
+def validate_digest(root: Path, project: str, covers: str | None, entry: str, *, replace: bool = False) -> str:
     if not covers:
         raise NotchError("digest entries need --covers WEEK, e.g. --covers 2026-W47")
     week = format_week(parse_week(covers)[0])
     require_closed_week(week)
-    known = {existing.entry_id for existing in iter_entries(root)}
+    entries = list(iter_entries(root))
+    known = {existing.entry_id for existing in entries}
     unknown = sorted(set(ID_RE.findall(entry)) - known)
     if unknown:
         raise NotchError(f"digest cites unknown entry IDs: {', '.join(unknown)}")
+    folded = project.casefold()
+    existing = digests_by_week(entry for entry in entries if entry.project.casefold() == folded).get(week)
+    if existing and not replace:
+        raise NotchError(
+            f"{project} {week} already has a digest ({existing.entry_id}), possibly from another machine; "
+            "nothing written. Pass --replace to supersede it."
+        )
     return week
 
 
@@ -794,9 +935,19 @@ def format_week(date: dt.date) -> str:
     return f"{year}-W{week:02d}"
 
 
+def digestible_from(week: str) -> dt.date:
+    """First UTC day a week may be digested: a grace period lets every machine sync its entries."""
+    return parse_week(week)[1] + dt.timedelta(days=DIGEST_GRACE_DAYS + 1)
+
+
 def require_closed_week(week: str) -> None:
-    if parse_week(week)[1] >= dt.date.today():
+    if parse_week(week)[1] >= utc_today():
         raise NotchError(f"{week} is not over yet; digests cover completed weeks")
+    if utc_today() < digestible_from(week):
+        raise NotchError(
+            f"{week} can be digested from {digestible_from(week)} (UTC), "
+            "once every machine has had time to sync its entries"
+        )
 
 
 def escape_entry_boundaries(entry: str) -> str:
@@ -852,12 +1003,80 @@ def git_context(root: Path, cwd: Path | None = None) -> str | None:
             branch = "detached" if head_name == "(detached)" else head_name
         elif line and not line.startswith("#"):
             dirty = True
-    text = f"{Path(toplevel).name} {branch}@{sha}"
+    text = f"{repo_label(Path(toplevel), cwd)} {branch}@{sha}"
     return f"{text} dirty" if dirty else text
 
 
+def repo_label(toplevel: Path, cwd: Path | None = None) -> str:
+    """The repo's name as its origin remote spells it, so every clone agrees; else the folder name."""
+    try:
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=3, cwd=cwd,
+        )
+    except (OSError, subprocess.SubprocessError):
+        remote = None
+    if remote and remote.returncode == 0 and remote.stdout.strip():
+        name = re.split(r"[/:]", remote.stdout.strip().rstrip("/"))[-1].removesuffix(".git")
+        name = sanitize_name(name)
+        if name:
+            return name
+    return sanitize_name(toplevel.name) or toplevel.name
+
+
+def current_repo(root: Path, cwd: Path | None = None) -> tuple[str, str] | None:
+    """(remote name, folder name) of the git checkout notch runs in, unless it is the notebook itself."""
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=3, cwd=cwd,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if top.returncode != 0 or not top.stdout.strip():
+        return None
+    toplevel = Path(top.stdout.strip())
+    if toplevel.resolve() == root.resolve():
+        return None
+    return repo_label(toplevel, cwd), toplevel.name
+
+
+def repo_projects(entries: Iterable[Entry], repo: tuple[str, str]) -> list[str]:
+    """Projects logged from this repo (by the git line), most entries first."""
+    names = {name.casefold() for name in repo}
+    entries = list(entries)
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if entry.git and entry.git.split(" ", 1)[0].casefold() in names:
+            counts[entry.project.casefold()] = counts.get(entry.project.casefold(), 0) + 1
+    spellings = most_used_spellings((entry.project for entry in entries), str.casefold)
+    return [spellings[key] for key in sorted(counts, key=lambda key: -counts[key])]
+
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "notch" / "config.toml"
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise NotchError(f"could not read {path}: {exc}") from None
+
+
+def save_config(config: dict) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Written by `notch setup`."]
+    # JSON strings and lists of strings are valid TOML values.
+    lines += [f"{key} = {json.dumps(value)}" for key, value in config.items() if value not in (None, "", [])]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def notebook_dir() -> Path:
-    configured = os.environ.get("NB_DIR")
+    configured = os.environ.get("NB_DIR") or load_config().get("notebook")
     if configured:
         return Path(configured).expanduser()
     return Path.home() / "Documents" / "notch-notebook"
@@ -868,8 +1087,18 @@ def default_author() -> str:
     if not raw and os.environ.get("CLAUDECODE") == "1" and not sys.stdin.isatty():
         # An agent's shell inside Claude Code; a human there would be at a terminal.
         raw = "claude"
-    raw = raw or getpass.getuser() or "user"
+    raw = raw or load_config().get("name") or getpass.getuser() or "user"
     return sanitize_name(raw) or "user"
+
+
+def user_name() -> str:
+    """The human using this machine, for machine IDs: the configured name, else the OS user."""
+    return sanitize_name(load_config().get("name") or getpass.getuser() or "") or "user"
+
+
+def new_machine_id() -> str:
+    host = sanitize_name(socket.gethostname().split(".")[0]) or "machine"
+    return f"{user_name()[:16]}-{host[:16]}-{uuid.uuid4().hex[:4]}"
 
 
 def machine_id(root: Path) -> str:
@@ -878,9 +1107,7 @@ def machine_id(root: Path) -> str:
         value = path.read_text(encoding="utf-8").strip()
         validate_name("machine id", value)
         return value
-
-    base = sanitize_name(socket.gethostname().split(".")[0]) or "machine"
-    value = f"{base}-{uuid.uuid4().hex[:4]}"
+    value = new_machine_id()
     path.write_text(value + "\n", encoding="utf-8")
     return value
 
@@ -1050,14 +1277,26 @@ def next_sequence(existing: str, project: str, date: dt.date, machine: str) -> i
     return highest + 1
 
 
-def iter_entries(root: Path) -> Iterable[Entry]:
+def daily_files(root: Path) -> list[Path]:
+    """Daily files: entries/<machine>/YYYY-MM-DD.txt, plus old-layout YYYY-MM-DD.txt at the root."""
     if not root.exists():
-        return
-    for path in sorted(root.iterdir()):
-        if not path.is_file() or not DATE_FILE_RE.match(path.name):
-            continue
+        return []
+    files = [path for path in root.iterdir() if path.is_file() and DATE_FILE_RE.match(path.name)]
+    entries_dir = root / ENTRIES_DIR
+    if entries_dir.is_dir():
+        for machine in entries_dir.iterdir():
+            if machine.is_dir():
+                files += [path for path in machine.iterdir() if path.is_file() and DATE_FILE_RE.match(path.name)]
+    return sorted(files)
+
+
+def iter_entries(root: Path) -> list[Entry]:
+    """All entries, ordered by date then time (UTC since 0.2); a stable sort keeps file order on ties."""
+    entries: list[Entry] = []
+    for path in daily_files(root):
         date = dt.date.fromisoformat(path.stem)
-        yield from parse_entries(path.read_text(encoding="utf-8"), date=date, path=path)
+        entries += parse_entries(path.read_text(encoding="utf-8"), date=date, path=path)
+    return sorted(entries, key=lambda entry: (entry.date, entry.time))
 
 
 def parse_entries(text: str, *, date: dt.date, path: Path) -> list[Entry]:
@@ -1086,7 +1325,7 @@ def parse_entries(text: str, *, date: dt.date, path: Path) -> list[Entry]:
             tags = parse_tags(meta.group("tags"))
         except NotchError:
             continue
-        allowed = {"git", "covers"} if entry_type == "digest" else {"git"}
+        allowed = {"git", "model", "covers"} if entry_type == "digest" else {"git", "model"}
         extra: dict[str, str] = {}
         idx = start + 2
         while idx < text_end:
@@ -1107,16 +1346,25 @@ def parse_entries(text: str, *, date: dt.date, path: Path) -> list[Entry]:
                 entry_type=entry_type,
                 tags=tags,
                 git=extra.get("git"),
+                model=extra.get("model"),
                 covers=extra.get("covers"),
             )
         )
     return entries
 
 
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_today() -> dt.date:
+    return utc_now().date()
+
+
 def parse_since(value: str) -> dt.date:
     match = re.match(r"^(\d+)d$", value)
     if match:
-        return dt.date.today() - dt.timedelta(days=int(match.group(1)))
+        return utc_today() - dt.timedelta(days=int(match.group(1)))
     try:
         return dt.date.fromisoformat(value)
     except ValueError:
@@ -1217,6 +1465,542 @@ def read_line(prompt_text: str) -> str:
             chars.append(char)
             sys.stdout.write(char)
             sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Sync: each machine commits only entries/<its id>/, so pulls never conflict.
+
+
+def run_git(root: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never hang waiting for credentials
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["git", *args], 124, "", f"git {args[0]} timed out after {timeout:.0f}s")
+    except OSError as exc:
+        return subprocess.CompletedProcess(["git", *args], 127, "", str(exc))
+
+
+def git_error(result: subprocess.CompletedProcess) -> str:
+    lines = [line.strip() for line in (result.stderr or result.stdout).splitlines() if line.strip()]
+    for line in lines:  # git's own diagnosis, rather than the hints that follow it
+        if line.startswith(("fatal:", "error:", "! [")):
+            return line
+    return lines[-1] if lines else f"exit status {result.returncode}"
+
+
+def notebook_remote(root: Path) -> bool:
+    """True when the notebook is a git checkout with a remote to sync with."""
+    if not (root / ".git").exists():
+        return False
+    result = run_git(root, "remote", timeout=5)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def sync_stamp(root: Path) -> Path:
+    return root / ".git" / "notch-last-sync"  # inside .git, so it is never committed
+
+
+def sync_notebook(root: Path) -> str | None:
+    """Commit this machine's entries, pull, and push. Returns an error message, or None on success."""
+    if not notebook_remote(root):
+        return "the notebook is not a git repository with a remote"
+    error = None
+    with file_lock(root):
+        machine = machine_id(root)
+        if (root / ENTRIES_DIR / machine).exists():
+            run_git(root, "add", "-A", "--", f"{ENTRIES_DIR}/{machine}")
+            if run_git(root, "diff", "--cached", "--quiet").returncode == 1:
+                commit = run_git(root, "commit", "-q", "-m", f"notch: entries from {machine}")
+                if commit.returncode != 0:
+                    error = f"commit failed: {git_error(commit)}"
+        has_upstream = run_git(root, "rev-parse", "--abbrev-ref", "@{u}", timeout=5).returncode == 0
+        branch = run_git(root, "symbolic-ref", "-q", "--short", "HEAD", timeout=5).stdout.strip()
+        if error is None and not has_upstream and branch:
+            # A clone of an empty remote has no upstream until someone pushes; adopt it once it exists.
+            fetch = run_git(root, "fetch", "-q", "origin")
+            if fetch.returncode != 0:
+                error = f"fetch failed: {git_error(fetch)}"
+            elif run_git(root, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{branch}", timeout=5).returncode == 0:
+                run_git(root, "branch", "-q", f"--set-upstream-to=origin/{branch}", timeout=5)
+                has_upstream = True
+        if error is None and has_upstream:
+            pull = run_git(root, "pull", "--rebase", "--autostash", "-q")
+            if pull.returncode != 0:
+                if (root / ".git" / "rebase-merge").exists() or (root / ".git" / "rebase-apply").exists():
+                    run_git(root, "rebase", "--abort")
+                error = f"pull failed: {git_error(pull)}"
+        if error is None and run_git(root, "rev-parse", "-q", "--verify", "HEAD", timeout=5).returncode == 0:
+            ahead = run_git(root, "rev-list", "--count", "@{u}..HEAD", timeout=5) if has_upstream else None
+            if ahead is None or ahead.stdout.strip() not in {"", "0"}:
+                push = run_git(root, "push", "-q", *(() if has_upstream else ("-u", "origin", "HEAD")))
+                if push.returncode != 0:
+                    error = f"push failed: {git_error(push)}"
+        sync_stamp(root).write_text(error or "ok", encoding="utf-8")
+    return error
+
+
+def last_sync(root: Path) -> tuple[float, str] | None:
+    """(time, 'ok' or the error) of the last sync attempt on this machine."""
+    stamp = sync_stamp(root)
+    if not stamp.exists():
+        return None
+    return stamp.stat().st_mtime, stamp.read_text(encoding="utf-8").strip() or "ok"
+
+
+def sync_if_stale(root: Path) -> str | None:
+    """Sync when the last attempt is over SYNC_INTERVAL old; return a message for the reader, if any."""
+    if os.environ.get("NOTCH_NO_SYNC") or not notebook_remote(root):
+        return None
+    previous = last_sync(root)
+    if previous is None or time.time() - previous[0] > SYNC_INTERVAL:
+        error = sync_notebook(root)
+    else:
+        error = None if previous[1] == "ok" else previous[1]
+    if error:
+        return (
+            f"Notebook sync failed ({error}). Entries from other machines may be missing. "
+            "Tell the user; `notch sync` retries."
+        )
+    return None
+
+
+def start_background_sync(root: Path) -> None:
+    """Push a new entry without making the writer wait; failures show up in the next catchup."""
+    if os.environ.get("NOTCH_NO_SYNC") or not notebook_remote(root):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "notch.cli", "sync", "--quiet"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env={**os.environ, "NB_DIR": str(root)},
+        )
+    except OSError:
+        pass
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    root = notebook_dir()
+    error = sync_notebook(root)
+    if error:
+        if not args.quiet:
+            print(f"notch: sync failed: {error}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"synced {root}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Versions: notch never updates itself; it tells the reader what to run.
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", value)[:3])
+
+
+def notebook_settings(root: Path) -> dict:
+    path = root / SETTINGS_FILE
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
+def min_version_notice(root: Path) -> str | None:
+    needed = str(notebook_settings(root).get("min_version", ""))
+    installed = notch_version()
+    if needed and installed != "unknown" and version_tuple(installed) < version_tuple(needed):
+        return (
+            f"This notebook needs notch {needed} or newer; {installed} is installed. "
+            f"Ask the user before updating: {upgrade_command()}"
+        )
+    return None
+
+
+def require_min_version(root: Path) -> None:
+    notice = min_version_notice(root)
+    if notice:
+        raise NotchError(f"not written. {notice}")
+
+
+def install_info() -> dict:
+    """uv's record of where notch was installed from (direct_url.json), or {}."""
+    dist = notch_distribution()
+    text = dist.read_text("direct_url.json") if dist else None
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def upgrade_command() -> str:
+    info = install_info()
+    url = info.get("url", "")
+    if info.get("vcs_info", {}).get("vcs") == "git":
+        return f"uv tool install --force git+{url} && notch setup"
+    if url.startswith("file:") and not info.get("dir_info", {}).get("editable"):
+        source = Path(unquote(urlparse(url).path))
+        return f"uv tool install --force --reinstall-package notch {source} && notch setup"
+    return "uv tool upgrade notch && notch setup"
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "notch"
+
+
+def remote_update_notice() -> str | None:
+    """Compare the installed git commit with the remote's, at most once per UPDATE_INTERVAL."""
+    if os.environ.get("NOTCH_NO_UPDATE_CHECK"):
+        return None
+    vcs = install_info().get("vcs_info", {})
+    url = install_info().get("url", "")
+    installed = vcs.get("commit_id", "")
+    if vcs.get("vcs") != "git" or not url or not installed:
+        return None
+    cache = cache_dir() / "update-check.json"
+    try:
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    if cached.get("url") == url and time.time() - cached.get("checked", 0) < UPDATE_INTERVAL:
+        latest = cached.get("latest", "")
+    else:
+        ref = vcs.get("requested_revision") or "HEAD"
+        result = run_git(Path.home(), "ls-remote", url, ref, timeout=10)
+        latest = result.stdout.split()[0] if result.returncode == 0 and result.stdout.split() else ""
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"url": url, "checked": time.time(), "latest": latest}), encoding="utf-8")
+        except OSError:
+            pass
+    if latest and latest != installed:
+        return (
+            f"A newer notch is available ({installed[:7]} -> {latest[:7]}). "
+            f"Ask the user before updating: {upgrade_command()}"
+        )
+    return None
+
+
+def update_notices(root: Path) -> list[str]:
+    """Everything the reader should tell the user about this install, most urgent first."""
+    notices = [min_version_notice(root), remote_update_notice()]
+    local = local_update_check()
+    if local:
+        notices.append(f"The local notch source is newer than the install. Ask the user, then run: {upgrade_command()}")
+    if not config_path().exists():
+        notices.append(
+            "Notch is not set up on this machine. Ask the user for their name and notebook, then run "
+            "`notch setup --name NAME` (see `notch setup --help`)."
+        )
+    elif skill_path().exists() and skill_path().read_text(encoding="utf-8") != packaged_skill():
+        notices.append("The installed notch skill does not match this version of notch. Run `notch setup` to refresh it.")
+    return [notice for notice in notices if notice]
+
+
+def print_notices(notices: list[str]) -> None:
+    if notices:
+        print("== Notices ==")
+        for notice in notices:
+            print(f"- {notice}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Agent instructions, shipped inside the package so they update with notch.
+
+
+def packaged_skill() -> str:
+    return importlib.resources.files("notch").joinpath("SKILL.md").read_text(encoding="utf-8")
+
+
+def skill_body() -> str:
+    """The skill without its frontmatter, for agents that have no skills directory."""
+    text = packaged_skill()
+    if text.startswith("---\n"):
+        text = text.split("\n---\n", 1)[1].lstrip("\n")
+    return text
+
+
+def skill_path() -> Path:
+    return Path.home() / ".claude" / "skills" / "notch" / "SKILL.md"
+
+
+GLOBAL_INSTRUCTIONS = """\
+## Notch
+
+Notch is a shared plain-text lab notebook for durable, cross-session project
+notes. Before starting work in a git repo, run `notch catchup` there and act on
+what it prints. {how}
+
+Log outcomes, not progress: write an entry when a result is measured, a
+decision is settled, or a session ends with work in flight.
+"""
+CLAUDE_HOW = "The `notch` skill has the conventions."
+OTHER_HOW = "Run `notch guide` once per session first: it prints the conventions."
+
+SETUP_EXPLAINER = """\
+How notch works
+- Notch is a shared lab notebook. You and your agents log outcomes (results,
+  decisions, findings, where work stands at the end of a session), not steps.
+- Each machine writes only its own files, entries/<machine>/YYYY-MM-DD.txt, so
+  syncing through git never conflicts. Times and dates are UTC.
+- Sync is automatic: `notch add` pushes in the background, and `notch catchup`
+  pulls when the last sync is over an hour old. `notch sync` does it by hand.
+- Agents start work in a repo with `notch catchup`. A repo with no project yet
+  makes the agent ask you whether to start one (`notch ignore` says no).
+- Each project gets a weekly digest, which agents write from the Wednesday
+  after the week ends.
+- When notch needs an update, it shows your agent the command and the agent
+  asks you first.
+Try: `notch` (entry form), `notch projects`, `notch catchup PROJECT`.
+"""
+
+
+def upsert_block(path: Path, content: str) -> str:
+    """Put content between the notch markers in path, replacing an earlier block. Returns what happened."""
+    block = f"{BLOCK_BEGIN}\n{content.rstrip()}\n{BLOCK_END}\n"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if BLOCK_BEGIN in text and BLOCK_END in text:
+        head, rest = text.split(BLOCK_BEGIN, 1)
+        tail = rest.split(BLOCK_END, 1)[1].lstrip("\n")
+        updated = head + block + (f"\n{tail}" if tail else "")
+        action = "updated" if updated != text else "unchanged"
+    else:
+        updated = (text.rstrip("\n") + "\n\n" + block) if text.strip() else block
+        action = "added"
+    if updated != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(updated, encoding="utf-8")
+    return action
+
+
+def cmd_guide(args: argparse.Namespace) -> int:
+    print(skill_body(), end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Setup: everything one machine needs, runnable by an agent (flags only).
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    config = load_config()
+    name = sanitize_name(args.name or config.get("name") or getpass.getuser() or "")
+    if not name:
+        raise NotchError("pass --name with your name, e.g. --name andrew")
+    default = Path(config.get("notebook") or Path.home() / "Documents" / "notch-notebook")
+    root = Path(args.notebook).expanduser() if args.notebook else default.expanduser()
+    root = root.resolve()
+
+    if args.clone:
+        if root.exists() and any(root.iterdir()):
+            origin = run_git(root, "remote", "get-url", "origin", timeout=5).stdout.strip() if (root / ".git").exists() else ""
+            if origin.rstrip("/").removesuffix(".git") != args.clone.rstrip("/").removesuffix(".git"):
+                raise NotchError(f"{root} exists and is not a clone of {args.clone}; pass --notebook with another path")
+            print(f"notebook: {root} (already cloned)")
+        else:
+            root.parent.mkdir(parents=True, exist_ok=True)
+            clone = run_git(root.parent, "clone", "-q", args.clone, str(root), timeout=300)
+            if clone.returncode != 0:
+                raise NotchError(f"clone failed: {git_error(clone)}")
+            print(f"notebook: cloned {args.clone} to {root}")
+    else:
+        existed = root.exists()
+        root.mkdir(parents=True, exist_ok=True)
+        print(f"notebook: {root}{'' if existed else ' (created)'}")
+
+    config.update(notebook=str(root), name=name)
+    save_config(config)
+    print(f"config:   {config_path()} (name {name})")
+    if os.environ.get("NB_DIR") and Path(os.environ["NB_DIR"]).expanduser().resolve() != root:
+        print(f"warning:  NB_DIR={os.environ['NB_DIR']} is set and overrides the configured notebook")
+
+    id_path = root / ".machine-id"
+    old_id = id_path.read_text(encoding="utf-8").strip() if id_path.exists() else ""
+    if old_id.startswith(f"{name}-"):
+        print(f"machine:  {old_id}")
+    else:
+        new_id = new_machine_id()
+        id_path.write_text(new_id + "\n", encoding="utf-8")
+        print(f"machine:  {new_id}" + (f" (was {old_id}; earlier entries keep their IDs)" if old_id else ""))
+
+    changed = []
+    gitignore = root / ".gitignore"
+    lines = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
+    missing = [line for line in NOTEBOOK_GITIGNORE if line not in lines]
+    if missing:
+        gitignore.write_text("\n".join([*lines, *missing]) + "\n", encoding="utf-8")
+        changed.append(".gitignore")
+    settings = root / SETTINGS_FILE
+    if not settings.exists():
+        settings.write_text(
+            "# Shared notch settings for this notebook. Raise min_version when the\n"
+            "# notebook needs a newer notch; older installs then refuse to write.\n"
+            f'min_version = "{notch_version()}"\n',
+            encoding="utf-8",
+        )
+        changed.append(SETTINGS_FILE)
+    if changed and (root / ".git").exists():
+        run_git(root, "add", "--", *changed)
+        run_git(root, "commit", "-q", "-m", "notch: notebook settings", "--", *changed)
+    if changed:
+        print(f"files:    wrote {', '.join(changed)}")
+
+    legacy = [path for path in root.iterdir() if path.is_file() and DATE_FILE_RE.match(path.name)]
+    if legacy:
+        print(
+            f"layout:   {len(legacy)} daily files use the old shared layout. Once every machine has synced\n"
+            "          them, run `notch migrate` on one machine to move them into per-machine folders."
+        )
+
+    skill = skill_path()
+    before = skill.read_text(encoding="utf-8") if skill.exists() else None
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(packaged_skill(), encoding="utf-8")
+    print(f"skill:    {skill} ({'unchanged' if before == packaged_skill() else 'installed'})")
+    claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    action = upsert_block(claude_md, GLOBAL_INSTRUCTIONS.format(how=CLAUDE_HOW))
+    print(f"claude:   {claude_md} ({action})")
+    codex_dir = Path.home() / ".codex"
+    if codex_dir.is_dir():
+        action = upsert_block(codex_dir / "AGENTS.md", GLOBAL_INSTRUCTIONS.format(how=OTHER_HOW))
+        print(f"codex:    {codex_dir / 'AGENTS.md'} ({action})")
+    print("other agents: point them at `notch guide` and `notch catchup`.")
+
+    if notebook_remote(root):
+        if not run_git(root, "config", "user.name", timeout=5).stdout.strip():
+            print("warning:  git user.name is not set; sync cannot commit until it is (git config --global user.name ...)")
+        error = sync_notebook(root)
+        print(f"sync:     {'ok' if error is None else 'FAILED: ' + error}")
+    else:
+        print("sync:     off (the notebook is not a git repository with a remote; entries stay on this machine)")
+    print()
+    print(SETUP_EXPLAINER, end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Migration from the old layout (all machines appending to YYYY-MM-DD.txt).
+
+
+def entry_machine(meta: re.Match) -> str | None:
+    """The machine segment of an entry ID: <project>-<YYYYMMDD>-<machine>-<NNN>."""
+    entry_id, project = meta.group("id"), meta.group("project")
+    if not entry_id.startswith(f"{project}-"):
+        return None
+    machine = entry_id[len(project) + 10 : -4]
+    return machine if NAME_RE.match(machine) else None
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    root = notebook_dir()
+    legacy = sorted(path for path in root.iterdir() if path.is_file() and DATE_FILE_RE.match(path.name)) if root.exists() else []
+    if not legacy:
+        print("nothing to migrate: no daily files at the notebook root")
+        return 0
+    with file_lock(root):
+        before = sorted(entry.entry_id for entry in iter_entries(root))
+        additions: dict[Path, list[str]] = {}
+        for path in legacy:
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            starts = [
+                idx for idx, line in enumerate(lines[:-1])
+                if line.strip() == "---" and META_RE.match(lines[idx + 1].rstrip("\n"))
+            ]
+            if not starts or "".join(lines[: starts[0]]).strip():
+                raise NotchError(f"{path.name} has text before its first entry; move it into an entry by hand, then rerun")
+            for pos, start in enumerate(starts):
+                end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+                chunk = "".join(lines[start:end]).rstrip("\n") + "\n"
+                machine = entry_machine(META_RE.match(lines[start + 1].rstrip("\n")))
+                if machine is None:
+                    raise NotchError(f"{path.name}: cannot read the machine from '{lines[start + 1].strip()}'")
+                additions.setdefault(root / ENTRIES_DIR / machine / path.name, []).append(chunk)
+        new_text: dict[Path, str] = {}
+        for target, chunks in additions.items():
+            existing = target.read_text(encoding="utf-8").rstrip("\n") if target.exists() else ""
+            new_text[target] = "\n".join(([existing + "\n"] if existing else []) + chunks)
+        # Check nothing is lost before touching any file.
+        after = [entry.entry_id for path in daily_files(root) if path not in legacy and path not in new_text
+                 for entry in parse_entries(path.read_text(encoding="utf-8"), date=dt.date.fromisoformat(path.stem), path=path)]
+        for target, text in new_text.items():
+            after += [entry.entry_id for entry in parse_entries(text, date=dt.date.fromisoformat(target.stem), path=target)]
+        if sorted(after) != before:
+            raise NotchError("migration check failed: entries would change; nothing was moved")
+        for target, text in new_text.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        for path in legacy:
+            path.unlink()
+        machines = sorted({target.parent.name for target in new_text})
+        print(f"moved {len(before)} entries from {len(legacy)} daily files into {ENTRIES_DIR}/ ({', '.join(machines)})")
+        if (root / ".git").exists():
+            run_git(root, "rm", "-q", "--cached", "--ignore-unmatch", "--", *(path.name for path in legacy))
+            run_git(root, "add", "-A", "--", ENTRIES_DIR)
+            commit = run_git(root, "commit", "-q", "-m", "notch: move daily files into per-machine folders")
+            if commit.returncode == 0:
+                print("committed; run `notch sync` to push")
+            else:
+                print(f"not committed: {git_error(commit)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Projects and repos.
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    entries = list(iter_entries(notebook_dir()))
+    spellings = most_used_spellings((entry.project for entry in entries), str.casefold)
+    stats: dict[str, dict] = {}
+    for entry in entries:
+        item = stats.setdefault(entry.project.casefold(), {"count": 0, "last": entry.date, "repos": {}, "authors": set()})
+        item["count"] += 1
+        item["last"] = max(item["last"], entry.date)
+        item["authors"].add(entry.author)
+        if entry.git:
+            repo = entry.git.split(" ", 1)[0]
+            item["repos"][repo] = item["repos"].get(repo, 0) + 1
+    if not stats:
+        print("no projects yet")
+        return 0
+    for key in sorted(stats, key=lambda key: stats[key]["last"], reverse=True):
+        item = stats[key]
+        repos = ", ".join(sorted(item["repos"], key=lambda repo: -item["repos"][repo])) or "-"
+        print(
+            f"{spellings[key]}  {count_entries(item['count'])}, last {item['last']}, "
+            f"repos: {repos}, authors: {', '.join(sorted(item['authors']))}"
+        )
+    return 0
+
+
+def cmd_ignore(args: argparse.Namespace) -> int:
+    root = notebook_dir()
+    repo = current_repo(root)
+    if repo is None:
+        raise NotchError("run this inside the git repo to ignore")
+    config = load_config()
+    ignored = [name for name in config.get("ignored_repos", []) if name.casefold() != repo[0].casefold()]
+    if not args.undo:
+        ignored.append(repo[0])
+    config["ignored_repos"] = sorted(ignored)
+    save_config(config)
+    if args.undo:
+        print(f"notch catchup will offer to log repo {repo[0]} again")
+    else:
+        print(f"notch catchup will not offer to log repo {repo[0]} on this machine (`notch ignore --undo` reverses it)")
+    return 0
+
+
+def repo_ignored(repo: tuple[str, str]) -> bool:
+    return repo[0].casefold() in {name.casefold() for name in load_config().get("ignored_repos", [])}
+
 
 
 class file_lock:
