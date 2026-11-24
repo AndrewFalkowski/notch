@@ -27,7 +27,7 @@ Directory layout:
 
   ~/Documents/notch-notebook/
     entries/
-      andrew-melchior-8ec2/
+      andrew-luna-8ec2/
         2026-11-24.txt   ← one file per machine per UTC day
       sam-laptop-41c0/
         2026-11-24.txt
@@ -45,8 +45,7 @@ Notch 0.1 kept all machines' entries in shared YYYY-MM-DD.txt files at the
 notebook root. Notch still reads those, and "notch migrate" moves them into
 per-machine folders. Shared files cannot be synced safely: two machines
 appending to one file conflict on every pull, and git's union merge keeps the
-"---" separator lines only once, which folds one entry into another
-(notch-20261124-melchior-8ec2-001).
+"---" separator lines only once, which folds one entry into another.
 
 
 ENTRY FORMAT
@@ -144,9 +143,9 @@ Format: <project>-<YYYYMMDD>-<machine>-<NNN>
 
 Each machine gets a stable machine ID, generated once and stored in
 .machine-id: the user's name, the sanitized hostname, and a short random
-suffix (e.g. andrew-melchior-8ec2), so an ID shows whose machine wrote it.
+suffix (e.g. andrew-luna-8ec2), so an ID shows whose machine wrote it.
 "notch setup --name" replaces an ID that does not start with the name; old
-entries keep their IDs. 0.1 IDs have no name (melchior-8ec2). It uses letters, numbers, "_", and "-". .machine-id must not
+entries keep their IDs. 0.1 IDs have no name (luna-8ec2). It uses letters, numbers, "_", and "-". .machine-id must not
 be synced between machines (keep it in the notebook's .gitignore), or two
 machines would share an ID.
 

@@ -18,7 +18,7 @@ An agent can run `notch setup` for you; it takes only flags. It:
 
 1. clones or creates the notebook (default `~/Documents/notch-notebook`; `--notebook PATH` picks another)
 2. saves your name and the notebook path to `~/.config/notch/config.toml`
-3. gives this machine an ID such as `andrew-melchior-8ec2`
+3. gives this machine an ID such as `andrew-luna-8ec2`
 4. installs the agent skill to `~/.claude/skills/notch/SKILL.md`
 5. adds a short "run `notch catchup`" block to `~/.claude/CLAUDE.md`, and to
    `~/.codex/AGENTS.md` if Codex is installed

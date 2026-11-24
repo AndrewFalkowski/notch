@@ -153,7 +153,7 @@ EOF
   legacy alias.
 
 On success, `notch add` prints the new entry's ID (e.g.
-`PROJECT-20261124-andrew-melchior-ab12-003`). Capture it and report it back
+`PROJECT-20261124-andrew-luna-ab12-003`). Capture it and report it back
 when relevant.
 
 ## Writing style
@@ -193,7 +193,7 @@ Bundle build is one command; parity now checks PyTorch→ONNX→Rust directly (m
 
 Entry IDs are stable. Cite them in entry text, and copy them verbatim from
 `add`/`search` output. Never hand-construct one: the machine segment
-(e.g. `andrew-melchior-ab12`) differs on every machine, so a guessed ID will
+(e.g. `andrew-luna-ab12`) differs on every machine, so a guessed ID will
 usually be wrong.
 
 When a new entry changes the standing of an older one, say so in its first
